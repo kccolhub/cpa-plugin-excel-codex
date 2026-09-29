@@ -156,7 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_ID}.h"
-          go run go/.github/scripts/package-release.go \
+          go run .github/scripts/package-release.go \
             -library "dist/windows-arm64/${PLUGIN_ID}.dll" \
             -archive "${ARCHIVE_NAME}" \
             -checksum "${ARCHIVE_NAME}.sha256"

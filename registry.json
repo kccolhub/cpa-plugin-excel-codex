@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "excel-codex",
+      "name": "Excel Codex",
+      "description": "CPA native executor for the Excel Codex bridge. Exposes Excel model aliases and forwards Responses API traffic to a configured bridge endpoint.",
+      "author": "kccolhub",
+      "version": "0.1.0",
+      "repository": "https://github.com/kccolhub/cpa-plugin-excel-codex",
+      "homepage": "https://github.com/kccolhub/cpa-plugin-excel-codex",
+      "license": "MIT",
+      "tags": ["cpa", "cliproxyapi", "codex", "excel", "responses"],
+      "auth_required": false
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+schema_version: 1
+id: excel-codex
+name: Excel Codex
+version: 0.1.0
+author: kccolhub
+description: >-
+  CPA native executor for the Excel Codex bridge. It exposes the Excel model
+  aliases and forwards OpenAI Responses requests to a configured Excel
+  bridge or excel-sub2api endpoint.
+repository: https://github.com/kccolhub/cpa-plugin-excel-codex
+license: MIT

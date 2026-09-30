@@ -56,10 +56,12 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -74,7 +76,7 @@ const pluginID = "excel-codex"
 
 // pluginVersion is overridden by the release workflow so the binary metadata
 // and the CPA release asset always use the same version.
-var pluginVersion = "0.1.0"
+var pluginVersion = "0.2.0"
 
 var currentConfig atomic.Value
 
@@ -102,11 +104,31 @@ func (e *statusError) Error() string   { return e.message }
 func (e *statusError) StatusCode() int { return e.statusCode }
 
 type pluginConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	BaseURL   string `yaml:"base_url"`
-	APIKey    string `yaml:"api_key"`
-	APIKeyEnv string `yaml:"api_key_env"`
-	AccountID string `yaml:"account_id"`
+	Enabled      bool   `yaml:"enabled"`
+	BaseURL      string `yaml:"base_url"`
+	AuthMode     string `yaml:"auth_mode"`
+	AuthProvider string `yaml:"auth_provider"`
+	AuthIndex    string `yaml:"auth_index"`
+	APIKey       string `yaml:"api_key"`
+	APIKeyEnv    string `yaml:"api_key_env"`
+	AccountID    string `yaml:"account_id"`
+}
+
+const (
+	authModeAuto    = "auto"
+	authModeHome    = "home"
+	authModeSidecar = "sidecar"
+)
+
+type upstreamCredentials struct {
+	Token         string
+	AccountID     string
+	AccountUserID string
+	Source        string
+}
+
+type hostAuthListResponse struct {
+	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
 type lifecycleRequest struct {
@@ -268,9 +290,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:   true,
-		BaseURL:   "http://127.0.0.1:8000",
-		APIKeyEnv: "EXCEL_CODEX_API_KEY",
+		Enabled:      true,
+		BaseURL:      "http://127.0.0.1:8000",
+		AuthMode:     authModeAuto,
+		AuthProvider: "codex",
+		APIKeyEnv:    "EXCEL_CODEX_API_KEY",
 	}
 }
 
@@ -288,11 +312,25 @@ func configure(raw []byte) error {
 		}
 	}
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	cfg.AuthMode = strings.ToLower(strings.TrimSpace(cfg.AuthMode))
+	cfg.AuthProvider = strings.ToLower(strings.TrimSpace(cfg.AuthProvider))
+	cfg.AuthIndex = strings.TrimSpace(cfg.AuthIndex)
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	cfg.APIKeyEnv = strings.TrimSpace(cfg.APIKeyEnv)
 	cfg.AccountID = strings.TrimSpace(cfg.AccountID)
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = defaultPluginConfig().BaseURL
+	}
+	if cfg.AuthMode == "" {
+		cfg.AuthMode = defaultPluginConfig().AuthMode
+	}
+	if cfg.AuthProvider == "" {
+		cfg.AuthProvider = defaultPluginConfig().AuthProvider
+	}
+	switch cfg.AuthMode {
+	case authModeAuto, authModeHome, authModeSidecar:
+	default:
+		return fmt.Errorf("auth_mode must be one of %q, %q, or %q", authModeAuto, authModeHome, authModeSidecar)
 	}
 	if cfg.APIKeyEnv == "" {
 		cfg.APIKeyEnv = defaultPluginConfig().APIKeyEnv
@@ -321,9 +359,12 @@ func pluginRegistration() registration {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable Excel Codex routing."},
 				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "Excel bridge base URL, for example http://excel-sub2api:8000 or https://bps.openai.com/basispoints/api."},
+				{Name: "auth_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{authModeAuto, authModeHome, authModeSidecar}, Description: "Credential source: home reuses a CPA Home Codex credential, sidecar uses the bridge API key, and auto selects based on the endpoint."},
+				{Name: "auth_provider", Type: pluginapi.ConfigFieldTypeString, Description: "Home credential provider to read when auth_mode is home or auto, normally codex."},
+				{Name: "auth_index", Type: pluginapi.ConfigFieldTypeString, Description: "Optional exact Home auth_index. Set this when Home stores more than one Codex credential."},
 				{Name: "api_key", Type: pluginapi.ConfigFieldTypeString, Description: "Bearer key for the configured Excel bridge endpoint. Leave empty to read api_key_env."},
 				{Name: "api_key_env", Type: pluginapi.ConfigFieldTypeString, Description: "Environment variable containing the bridge API key."},
-				{Name: "account_id", Type: pluginapi.ConfigFieldTypeString, Description: "Optional ChatGPT account ID forwarded as chatgpt-account-id."},
+				{Name: "account_id", Type: pluginapi.ConfigFieldTypeString, Description: "Optional account ID override forwarded as chatgpt-account-id."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -384,11 +425,15 @@ func execute(raw []byte) ([]byte, error) {
 	if !cfg.Enabled {
 		return nil, &statusError{code: "plugin_disabled", message: "Excel Codex plugin is disabled", statusCode: 503, retryable: false}
 	}
+	credentials, errCredentials := credentialsForRequest(cfg)
+	if errCredentials != nil {
+		return nil, &statusError{code: "credentials_unavailable", message: errCredentials.Error(), statusCode: 503, retryable: true}
+	}
 	body, errBody := requestBody(req.ExecutorRequest, false)
 	if errBody != nil {
 		return nil, errBody
 	}
-	resp, errHTTP := doHTTP(req.HostCallbackID, cfg, req.ExecutorRequest, body, false)
+	resp, errHTTP := doHTTP(req.HostCallbackID, cfg, credentials, req.ExecutorRequest, body, false)
 	if errHTTP != nil {
 		return nil, errHTTP
 	}
@@ -407,6 +452,10 @@ func executeStream(raw []byte) ([]byte, error) {
 	if !cfg.Enabled {
 		return nil, &statusError{code: "plugin_disabled", message: "Excel Codex plugin is disabled", statusCode: 503, retryable: false}
 	}
+	credentials, errCredentials := credentialsForRequest(cfg)
+	if errCredentials != nil {
+		return nil, &statusError{code: "credentials_unavailable", message: errCredentials.Error(), statusCode: 503, retryable: true}
+	}
 	if strings.TrimSpace(req.StreamID) == "" {
 		return nil, fmt.Errorf("stream_id is required")
 	}
@@ -414,7 +463,7 @@ func executeStream(raw []byte) ([]byte, error) {
 	if errBody != nil {
 		return nil, errBody
 	}
-	resp, errHTTP := doHTTPStream(req.HostCallbackID, cfg, req.ExecutorRequest, body)
+	resp, errHTTP := doHTTPStream(req.HostCallbackID, cfg, credentials, req.ExecutorRequest, body)
 	if errHTTP != nil {
 		return nil, errHTTP
 	}
@@ -445,13 +494,13 @@ func requestBody(req pluginapi.ExecutorRequest, stream bool) ([]byte, error) {
 	return json.Marshal(object)
 }
 
-func doHTTP(callbackID string, cfg pluginConfig, req pluginapi.ExecutorRequest, body []byte, stream bool) (hostHTTPResponse, error) {
+func doHTTP(callbackID string, cfg pluginConfig, credentials upstreamCredentials, req pluginapi.ExecutorRequest, body []byte, stream bool) (hostHTTPResponse, error) {
 	var resp hostHTTPResponse
 	raw, errCall := callHost(pluginabi.MethodHostHTTPDo, hostHTTPRequest{
 		HostCallbackID: callbackID,
 		Method:         http.MethodPost,
 		URL:            endpointURL(cfg.BaseURL),
-		Headers:        requestHeaders(cfg, req.Headers, stream),
+		Headers:        requestHeaders(credentials, req.Headers, stream),
 		Body:           body,
 	})
 	if errCall != nil {
@@ -463,13 +512,13 @@ func doHTTP(callbackID string, cfg pluginConfig, req pluginapi.ExecutorRequest, 
 	return resp, nil
 }
 
-func doHTTPStream(callbackID string, cfg pluginConfig, req pluginapi.ExecutorRequest, body []byte) (hostHTTPStreamResponse, error) {
+func doHTTPStream(callbackID string, cfg pluginConfig, credentials upstreamCredentials, req pluginapi.ExecutorRequest, body []byte) (hostHTTPStreamResponse, error) {
 	var resp hostHTTPStreamResponse
 	raw, errCall := callHost(pluginabi.MethodHostHTTPDoStream, hostHTTPRequest{
 		HostCallbackID: callbackID,
 		Method:         http.MethodPost,
 		URL:            endpointURL(cfg.BaseURL),
-		Headers:        requestHeaders(cfg, req.Headers, true),
+		Headers:        requestHeaders(credentials, req.Headers, true),
 		Body:           body,
 	})
 	if errCall != nil {
@@ -515,7 +564,7 @@ func pumpStream(outputID, upstreamID string) {
 	}
 }
 
-func requestHeaders(cfg pluginConfig, inbound http.Header, stream bool) http.Header {
+func requestHeaders(credentials upstreamCredentials, inbound http.Header, stream bool) http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	if stream {
@@ -523,12 +572,15 @@ func requestHeaders(cfg pluginConfig, inbound http.Header, stream bool) http.Hea
 	} else {
 		headers.Set("Accept", "application/json")
 	}
-	if key := apiKey(cfg); key != "" {
-		headers.Set("Authorization", "Bearer "+key)
+	if credentials.Token != "" {
+		headers.Set("Authorization", "Bearer "+credentials.Token)
 	}
-	if cfg.AccountID != "" {
-		headers.Set("chatgpt-account-id", cfg.AccountID)
-		headers.Set("x-openai-account-id", cfg.AccountID)
+	if credentials.AccountID != "" {
+		headers.Set("chatgpt-account-id", credentials.AccountID)
+		headers.Set("x-openai-account-id", credentials.AccountID)
+	}
+	if credentials.AccountUserID != "" {
+		headers.Set("x-openai-account-user-id", credentials.AccountUserID)
 	}
 	// These headers select the same backend profile used by the reference bridge.
 	defaults := map[string]string{
@@ -547,6 +599,186 @@ func requestHeaders(cfg pluginConfig, inbound http.Header, stream bool) http.Hea
 	}
 	_ = inbound // The CPA client API key must never be forwarded to the bridge.
 	return headers
+}
+
+func credentialsForRequest(cfg pluginConfig) (upstreamCredentials, error) {
+	switch cfg.AuthMode {
+	case authModeHome:
+		return loadHomeCredentials(cfg)
+	case authModeSidecar:
+		return sidecarCredentials(cfg)
+	case authModeAuto:
+		if isTrustedBPSBaseURL(cfg.BaseURL) {
+			if credentials, errHome := loadHomeCredentials(cfg); errHome == nil {
+				return credentials, nil
+			}
+		}
+		if key := apiKey(cfg); key != "" {
+			return upstreamCredentials{Token: key, AccountID: cfg.AccountID, Source: authModeSidecar}, nil
+		}
+		if isTrustedBPSBaseURL(cfg.BaseURL) {
+			return loadHomeCredentials(cfg)
+		}
+		return upstreamCredentials{}, fmt.Errorf("auth_mode=auto needs a sidecar API key for %s, or set auth_mode=home with https://bps.openai.com/basispoints/api", cfg.BaseURL)
+	default:
+		return upstreamCredentials{}, fmt.Errorf("unsupported auth_mode %q", cfg.AuthMode)
+	}
+}
+
+func sidecarCredentials(cfg pluginConfig) (upstreamCredentials, error) {
+	key := apiKey(cfg)
+	if key == "" {
+		return upstreamCredentials{}, fmt.Errorf("sidecar API key is empty; configure api_key or api_key_env")
+	}
+	return upstreamCredentials{Token: key, AccountID: cfg.AccountID, Source: authModeSidecar}, nil
+}
+
+func loadHomeCredentials(cfg pluginConfig) (upstreamCredentials, error) {
+	if !isTrustedBPSBaseURL(cfg.BaseURL) {
+		return upstreamCredentials{}, fmt.Errorf("auth_mode=home only permits https://bps.openai.com/basispoints/api; use auth_mode=sidecar for excel-sub2api")
+	}
+	rawList, errList := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	if errList != nil {
+		return upstreamCredentials{}, fmt.Errorf("Home auth list unavailable: %w", errList)
+	}
+	var list hostAuthListResponse
+	if errDecode := json.Unmarshal(rawList, &list); errDecode != nil {
+		return upstreamCredentials{}, fmt.Errorf("decode Home auth list: %w", errDecode)
+	}
+
+	var selected *pluginapi.HostAuthFileEntry
+	for index := range list.Files {
+		entry := &list.Files[index]
+		provider := strings.TrimSpace(entry.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(entry.Type)
+		}
+		if cfg.AuthIndex != "" && entry.AuthIndex != cfg.AuthIndex {
+			continue
+		}
+		if cfg.AuthProvider != "" && !strings.EqualFold(provider, cfg.AuthProvider) {
+			continue
+		}
+		if entry.Disabled || entry.Unavailable || entry.RuntimeOnly || entry.AuthIndex == "" {
+			continue
+		}
+		selected = entry
+		break
+	}
+	if selected == nil {
+		if cfg.AuthIndex != "" {
+			return upstreamCredentials{}, fmt.Errorf("Home auth_index %q was not found or is unavailable", cfg.AuthIndex)
+		}
+		return upstreamCredentials{}, fmt.Errorf("Home has no available %s credential", cfg.AuthProvider)
+	}
+
+	rawAuth, errGet := callHost(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: selected.AuthIndex})
+	if errGet != nil {
+		return upstreamCredentials{}, fmt.Errorf("read Home credential %s: %w", selected.AuthIndex, errGet)
+	}
+	var authFile pluginapi.HostAuthGetResponse
+	if errDecode := json.Unmarshal(rawAuth, &authFile); errDecode != nil {
+		return upstreamCredentials{}, fmt.Errorf("decode Home credential %s: %w", selected.AuthIndex, errDecode)
+	}
+	credentials, errExtract := extractHomeCredentials(authFile.JSON)
+	if errExtract != nil {
+		return upstreamCredentials{}, fmt.Errorf("Home credential %s: %w", selected.AuthIndex, errExtract)
+	}
+	if cfg.AccountID != "" {
+		credentials.AccountID = cfg.AccountID
+	}
+	credentials.Source = authModeHome
+	return credentials, nil
+}
+
+func extractHomeCredentials(raw []byte) (upstreamCredentials, error) {
+	var document map[string]any
+	if errDecode := json.Unmarshal(raw, &document); errDecode != nil {
+		return upstreamCredentials{}, fmt.Errorf("invalid auth JSON: %w", errDecode)
+	}
+	token := firstString(document, "access_token")
+	if token == "" {
+		token = nestedString(document, "tokens", "access_token")
+	}
+	if token == "" {
+		token = nestedString(document, "token", "access_token")
+	}
+	if token == "" {
+		return upstreamCredentials{}, fmt.Errorf("no ChatGPT access_token")
+	}
+	accountID := firstString(document, "account_id")
+	if accountID == "" {
+		accountID = nestedString(document, "tokens", "account_id")
+	}
+	accountUserID := firstString(document, "account_user_id", "chatgpt_account_user_id")
+	if accountUserID == "" {
+		accountUserID = jwtClaimString(token, "chatgpt_account_user_id")
+	}
+	if accountID == "" {
+		accountID = jwtClaimString(token, "chatgpt_account_id", "account_id")
+	}
+	if accountID == "" {
+		accountID = jwtClaimString(firstString(document, "id_token"), "chatgpt_account_id", "account_id")
+	}
+	if accountID == "" {
+		return upstreamCredentials{}, fmt.Errorf("no ChatGPT account_id")
+	}
+	return upstreamCredentials{
+		Token:         token,
+		AccountID:     accountID,
+		AccountUserID: accountUserID,
+	}, nil
+}
+
+func firstString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func nestedString(values map[string]any, objectKey, valueKey string) string {
+	nested, ok := values[objectKey].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return firstString(nested, valueKey)
+}
+
+func jwtClaimString(token string, keys ...string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
+	if errDecode != nil {
+		payload, errDecode = base64.URLEncoding.DecodeString(parts[1])
+	}
+	if errDecode != nil {
+		return ""
+	}
+	var claims map[string]any
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	if value := firstString(claims, keys...); value != "" {
+		return value
+	}
+	if authClaims, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		return firstString(authClaims, keys...)
+	}
+	return ""
+}
+
+func isTrustedBPSBaseURL(base string) bool {
+	parsed, errParse := url.Parse(strings.TrimSpace(base))
+	if errParse != nil || !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Hostname(), "bps.openai.com") {
+		return false
+	}
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	return path == "/basispoints/api"
 }
 
 func apiKey(cfg pluginConfig) string {

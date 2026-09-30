@@ -1,13 +1,20 @@
 # CPA Excel Codex 插件
 
-这是一个适配 CLIProxyAPI（CPA）原生插件 ABI 的动态库插件。它把参考项目
-[`excel-codex-bridge`](https://github.com/Kaixxrua/excel-codex-bridge) 的 Excel 模型别名和
-Responses API 接入 CPA：CPA 收到 `gpt-*-excel` 请求后，插件将请求转发到你配置的
-Excel bridge 或 `excel-sub2api` 端点，并支持非流式和 SSE 流式响应。
+这是一个适配 CLIProxyAPI（CPA）原生插件 ABI 的动态库插件。它参考
+[`excel-codex-bridge`](https://github.com/Kaixxrua/excel-codex-bridge)，把 Excel 模型别名和
+Responses API 接入 CPA：CPA 收到 `gpt-*-excel` 请求后，插件将请求转发到官方 BPS 上游或
+`excel-sub2api`，并支持非流式和 SSE 流式响应。
 
-插件不会读取 CPA 容器所在机器上的 Excel WebView 缓存，也不会自己实现登录。服务器部署时，
-请先按参考项目的 SUB2API 文档运行 bridge sidecar，并把 Excel/Codex 会话显式推送到你信任的
-sidecar；插件只持有 sidecar API key。这样本机 Excel 登录态不会被插件隐式扫描或落盘。
+插件支持两种凭证来源：
+
+- `auth_mode: home` 通过 CPA 的 `host.auth.list` / `host.auth.get` 回调读取 Home 已保存的
+  Codex 凭证，因此不需要再次登录。Home token 只允许发往固定的
+  `https://bps.openai.com/basispoints/api`。
+- `auth_mode: sidecar` 使用 `excel-sub2api` 自己的 API key。sidecar 仍然适合 CPA 与已登录
+  电脑分离的部署，但 ChatGPT token 和 sidecar API key 是两种不同的凭证。
+
+`auth_mode: auto` 会在官方 BPS 地址优先复用 Home 凭证，在其他地址使用 sidecar API key。
+Home 保存的凭证由 CPA 自己负责刷新，插件每次请求读取最新文件，不会写回或复制一份登录态。
 
 ## CPA 配置
 
@@ -23,18 +30,36 @@ plugins:
       enabled: true
       priority: 20
       base_url: http://excel-sub2api:8000
+      auth_mode: sidecar
       api_key_env: EXCEL_CODEX_API_KEY
+```
+
+如果 CPA Home 节点已经有 Codex 登录凭证，可以直接使用 Home 模式，不需要部署
+`excel-sub2api`：
+
+```yaml
+plugins:
+  enabled: true
+  configs:
+    excel-codex:
+      enabled: true
+      priority: 20
+      auth_mode: home
+      base_url: https://bps.openai.com/basispoints/api
+      auth_provider: codex
+      # Home 有多个 Codex 账号时，可填 host.auth.list 返回的 auth_index
+      # auth_index: codex-xxx.json
 ```
 
 `base_url` 可以是：
 
-- `http://excel-sub2api:8000`（推荐，插件会请求 `/v1/responses`）；
-- `https://host/v1`；
-- `https://bps.openai.com/basispoints/api`（直接访问上游时使用，会请求 `/responses`）。
+- `http://excel-sub2api:8000`（sidecar，插件会请求 `/v1/responses`）；
+- `https://host/v1`（sidecar 或其他兼容 bridge，只能配合 `auth_mode: sidecar`）；
+- `https://bps.openai.com/basispoints/api`（Home 模式固定使用，会请求 `/responses`）。
 
-API key 优先读配置中的 `api_key`，为空时读取 `api_key_env` 指定的环境变量。推荐通过
-Kubernetes Secret 注入环境变量，不要把 key 提交到配置仓库。`account_id` 可选，会同时发送
-`chatgpt-account-id` 和 `x-openai-account-id`。
+sidecar API key 优先读配置中的 `api_key`，为空时读取 `api_key_env` 指定的环境变量。推荐
+通过 Kubernetes Secret 注入环境变量，不要把 key 提交到配置仓库。Home 模式的
+`account_id` 只作为可选覆盖值；一般让插件从 Home auth JSON 或 JWT 中自动读取。
 
 安装后插件会提供以下模型：
 
@@ -60,7 +85,7 @@ curl -X POST \
 
 安装器会从 GitHub Release 下载当前平台的动态库，校验 `checksums.txt`，并自动启用插件。CPA
 需要能写入 `plugins.dir`；Kubernetes 部署请把该目录挂载到持久化卷，否则 Pod 重建后需要重新
-安装。安装后在插件配置中填写 sidecar 地址和 key，再重新加载配置。
+安装。安装后在插件配置中选择 Home 或 sidecar 模式，再重新加载配置。
 
 ## 构建
 

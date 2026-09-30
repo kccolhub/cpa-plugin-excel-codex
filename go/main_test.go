@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"testing"
@@ -42,7 +43,7 @@ func TestRequestBodyAddsModelAndStream(t *testing.T) {
 
 func TestRequestHeadersDoNotForwardInboundAuthorization(t *testing.T) {
 	inbound := http.Header{"Authorization": []string{"Bearer client-key"}}
-	headers := requestHeaders(pluginConfig{APIKey: "bridge-key", AccountID: "acct"}, inbound, true)
+	headers := requestHeaders(upstreamCredentials{Token: "bridge-key", AccountID: "acct"}, inbound, true)
 	if got := headers.Get("Authorization"); got != "Bearer bridge-key" {
 		t.Fatalf("authorization = %q, want bridge key", got)
 	}
@@ -51,6 +52,58 @@ func TestRequestHeadersDoNotForwardInboundAuthorization(t *testing.T) {
 	}
 	if got := headers.Get("Accept"); got != "text/event-stream" {
 		t.Fatalf("accept = %q, want event stream", got)
+	}
+}
+
+func TestRequestHeadersIncludeHomeAccountUserID(t *testing.T) {
+	headers := requestHeaders(upstreamCredentials{
+		Token:         "home-token",
+		AccountID:     "acct",
+		AccountUserID: "user",
+	}, nil, false)
+	if got := headers.Get("Authorization"); got != "Bearer home-token" {
+		t.Fatalf("authorization = %q, want home token", got)
+	}
+	if got := headers.Get("x-openai-account-user-id"); got != "user" {
+		t.Fatalf("x-openai-account-user-id = %q, want user", got)
+	}
+}
+
+func TestExtractHomeCredentialsTopLevel(t *testing.T) {
+	got, err := extractHomeCredentials([]byte(`{"type":"codex","access_token":"home-token","account_id":"acct"}`))
+	if err != nil {
+		t.Fatalf("extractHomeCredentials() error = %v", err)
+	}
+	if got.Token != "home-token" || got.AccountID != "acct" {
+		t.Fatalf("credentials = %#v, want top-level token and account", got)
+	}
+}
+
+func TestExtractHomeCredentialsFromNestedJWTClaims(t *testing.T) {
+	payload := `{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt","chatgpt_account_user_id":"user-jwt"}}`
+	token := "header." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".signature"
+	got, err := extractHomeCredentials([]byte(`{"type":"codex","access_token":"` + token + `"}`))
+	if err != nil {
+		t.Fatalf("extractHomeCredentials() error = %v", err)
+	}
+	if got.AccountID != "acct-jwt" || got.AccountUserID != "user-jwt" {
+		t.Fatalf("credentials = %#v, want JWT claims", got)
+	}
+}
+
+func TestHomeModeOnlyAllowsOfficialBPSEndpoint(t *testing.T) {
+	if !isTrustedBPSBaseURL("https://bps.openai.com/basispoints/api") {
+		t.Fatal("official BPS endpoint was rejected")
+	}
+	for _, baseURL := range []string{
+		"http://bps.openai.com/basispoints/api",
+		"https://bps.openai.com.evil.example/basispoints/api",
+		"https://excel-sub2api:8000",
+		"https://bps.openai.com/other",
+	} {
+		if isTrustedBPSBaseURL(baseURL) {
+			t.Fatalf("untrusted Home endpoint accepted: %s", baseURL)
+		}
 	}
 }
 

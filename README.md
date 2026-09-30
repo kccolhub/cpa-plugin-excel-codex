@@ -77,6 +77,10 @@ gpt-6-luna-excel         gpt-6-luna-1m-excel
 gpt-6-astra-excel        gpt-6-astra-1m-excel
 ```
 
+插件管理页会增加 `Excel Codex Bridge` 状态入口。这里可以查看当前生效的
+`auth_mode`、`base_url`、账号选择策略、Home 中匹配到的 Codex 账号，以及每个账号的请求、
+成功、失败和最近一次错误。页面只读取账号元数据和运行计数，不显示 access token。
+
 ## 管理 API 安装
 
 启用 `plugins.enabled` 后，CPA 管理页面可从上面的 registry 发现 `Excel Codex` 并一键安装。

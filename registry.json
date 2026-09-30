@@ -4,9 +4,9 @@
     {
       "id": "excel-codex",
       "name": "Excel Codex",
-      "description": "CPA native executor for the Excel Codex bridge. Uses every available CPA Home Codex credential as an internal bridge candidate for the official BPS endpoint, or forwards through an excel-sub2api sidecar.",
+      "description": "CPA native executor for the Excel Codex bridge. Uses every available CPA Home Codex credential as an internal bridge candidate, exposes a runtime status page, and can forward through an excel-sub2api sidecar.",
       "author": "kccolhub",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "repository": "https://github.com/kccolhub/cpa-plugin-excel-codex",
       "homepage": "https://github.com/kccolhub/cpa-plugin-excel-codex",
       "license": "MIT",

@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -207,5 +210,112 @@ func TestRequestAffinityKeyPrefersSessionHeadersThenMetadataThenQuery(t *testing
 	req.Metadata = nil
 	if got := requestAffinityKey(req); got != "query-session" {
 		t.Fatalf("requestAffinityKey() = %q, want query-session", got)
+	}
+}
+
+func TestRenderManagementStatusPageShowsRuntimeAndDoesNotExposeTokens(t *testing.T) {
+	token := "secret-token-should-not-appear"
+	page := renderManagementStatusPage(managementStatusPageData{
+		GeneratedAt: time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC),
+		Config: pluginConfig{
+			Enabled:      true,
+			BaseURL:      "https://bps.openai.com/basispoints/api",
+			AuthMode:     authModeHome,
+			AuthProvider: "codex",
+			AuthStrategy: authStrategySticky,
+		},
+		HomeAvailable: true,
+		Accounts: []managementAccountRow{{
+			AuthIndex:     "account-a",
+			Label:         "A@example.com",
+			Status:        "active",
+			Requests:      3,
+			Successes:     2,
+			Failures:      1,
+			LastStatus:    429,
+			LastError:     "quota exceeded",
+			LastRequestAt: time.Date(2026, 9, 30, 11, 59, 0, 0, time.UTC),
+		}},
+		Bridges: []managementBridgeRow{{
+			Source:        "sidecar",
+			Requests:      1,
+			Successes:     1,
+			LastStatus:    200,
+			LastRequestAt: time.Date(2026, 9, 30, 11, 58, 0, 0, time.UTC),
+		}},
+		TotalRequests:  3,
+		TotalSuccesses: 2,
+		TotalFailures:  1,
+		LastBridge:     "home:account-a",
+	})
+	body := string(page)
+	for _, want := range []string{"Excel Codex Bridge", "sticky", "A@example.com", "quota exceeded", "429", "Bridge sources", "sidecar"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status page does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, token) {
+		t.Fatal("status page leaked a credential token")
+	}
+}
+
+func TestRecordBridgeResultTracksCountersByHomeAuthIndex(t *testing.T) {
+	bridgeRuntime.Lock()
+	bridgeRuntime.bySource = make(map[string]*bridgeRuntimeEntry)
+	bridgeRuntime.Unlock()
+	recordBridgeResult("home:account-a", true, 200, "")
+	recordBridgeResult("home:account-a", false, 429, "quota exceeded")
+	snapshot := bridgeRuntimeSnapshot()
+	entry, ok := snapshot["home:account-a"]
+	if !ok {
+		t.Fatal("missing home bridge runtime entry")
+	}
+	if entry.Requests != 2 || entry.Successes != 1 || entry.Failures != 1 {
+		t.Fatalf("runtime counters = %#v, want 2/1/1", entry)
+	}
+	if entry.LastStatus != 429 || entry.LastError != "quota exceeded" {
+		t.Fatalf("runtime last result = %#v, want HTTP 429 quota exceeded", entry)
+	}
+}
+
+func TestManagementRegistrationDeclaresStatusResource(t *testing.T) {
+	raw, err := handleMethod(pluginabi.MethodManagementRegister, nil)
+	if err != nil {
+		t.Fatalf("management registration error = %v", err)
+	}
+	var envelope struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode management registration envelope: %v", err)
+	}
+	if !envelope.OK {
+		t.Fatal("management registration returned a failed envelope")
+	}
+	var registration struct {
+		Resources []struct {
+			Path        string `json:"path"`
+			Menu        string `json:"menu"`
+			Description string `json:"description"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(envelope.Result, &registration); err != nil {
+		t.Fatalf("decode management registration: %v", err)
+	}
+	if len(registration.Resources) != 1 || registration.Resources[0].Path != "/status" {
+		t.Fatalf("resources = %#v, want /status", registration.Resources)
+	}
+	if registration.Resources[0].Menu == "" || registration.Resources[0].Description == "" {
+		t.Fatalf("status resource metadata is incomplete: %#v", registration.Resources[0])
+	}
+	var hostRegistration struct {
+		Resources []pluginapi.ResourceRoute `json:"resources"`
+	}
+	if err := json.Unmarshal(envelope.Result, &hostRegistration); err != nil {
+		t.Fatalf("decode host resource schema: %v", err)
+	}
+	if len(hostRegistration.Resources) != 1 || hostRegistration.Resources[0].Path != "/status" {
+		t.Fatalf("host resources = %#v, want /status", hostRegistration.Resources)
 	}
 }

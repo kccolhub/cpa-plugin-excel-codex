@@ -61,12 +61,15 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"html"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -78,10 +81,28 @@ const pluginID = "excel-codex"
 
 // pluginVersion is overridden by the release workflow so the binary metadata
 // and the CPA release asset always use the same version.
-var pluginVersion = "0.3.0"
+var pluginVersion = "0.4.0"
 
 var currentConfig atomic.Value
 var homeBridgeCounter atomic.Uint64
+
+var bridgeRuntime = struct {
+	sync.Mutex
+	bySource map[string]*bridgeRuntimeEntry
+}{
+	bySource: make(map[string]*bridgeRuntimeEntry),
+}
+
+type bridgeRuntimeEntry struct {
+	Requests      uint64
+	Successes     uint64
+	Failures      uint64
+	LastStatus    int
+	LastError     string
+	LastRequestAt time.Time
+	LastSuccessAt time.Time
+	LastFailureAt time.Time
+}
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -155,6 +176,7 @@ type registrationCapability struct {
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
+	ManagementAPI         bool     `json:"management_api"`
 }
 
 type rpcExecutorRequest struct {
@@ -166,6 +188,66 @@ type rpcExecutorRequest struct {
 type rpcExecutorStreamResponse struct {
 	Headers http.Header                     `json:"headers,omitempty"`
 	Chunks  []pluginapi.ExecutorStreamChunk `json:"chunks,omitempty"`
+}
+
+type rpcManagementRequest struct {
+	pluginapi.ManagementRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type managementRegistrationResponse struct {
+	Routes    []managementResource `json:"routes,omitempty"`
+	Resources []managementResource `json:"resources,omitempty"`
+}
+
+type managementResource struct {
+	Path        string `json:"path"`
+	Menu        string `json:"menu"`
+	Description string `json:"description"`
+}
+
+type managementStatusPageData struct {
+	GeneratedAt    time.Time
+	Config         pluginConfig
+	HomeAvailable  bool
+	HomeError      string
+	Accounts       []managementAccountRow
+	Bridges        []managementBridgeRow
+	SidecarSource  string
+	TotalRequests  uint64
+	TotalSuccesses uint64
+	TotalFailures  uint64
+	LastBridge     string
+}
+
+type managementBridgeRow struct {
+	Source        string
+	Requests      uint64
+	Successes     uint64
+	Failures      uint64
+	LastStatus    int
+	LastError     string
+	LastRequestAt time.Time
+}
+
+type managementAccountRow struct {
+	AuthIndex     string
+	Name          string
+	Label         string
+	Email         string
+	Status        string
+	Disabled      bool
+	Unavailable   bool
+	RuntimeOnly   bool
+	Selected      bool
+	Requests      uint64
+	Successes     uint64
+	Failures      uint64
+	LastStatus    int
+	LastError     string
+	LastRequestAt time.Time
+	LastSuccessAt time.Time
+	LastFailureAt time.Time
 }
 
 type hostHTTPRequest struct {
@@ -291,6 +373,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return executeStream(request)
 	case pluginabi.MethodExecutorCountTokens:
 		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(managementRegistrationResponse{
+			Resources: []managementResource{{
+				Path:        "/status",
+				Menu:        "Excel Codex Bridge",
+				Description: "Shows the Excel Codex bridge runtime, Home account pool, and request counters.",
+			}},
+		})
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, 0, false), nil
 	}
@@ -393,6 +485,7 @@ func pluginRegistration() registration {
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
 			ExecutorInputFormats:  []string{"openai-response"},
 			ExecutorOutputFormats: []string{"openai-response"},
+			ManagementAPI:         true,
 		},
 	}
 }
@@ -455,11 +548,14 @@ func execute(raw []byte) ([]byte, error) {
 	}
 	resp, errHTTP := doHTTP(req.HostCallbackID, cfg, credentials, req.ExecutorRequest, body, false)
 	if errHTTP != nil {
+		recordBridgeResult(credentials.Source, false, statusCodeFromError(errHTTP), errHTTP.Error())
 		return nil, errHTTP
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		recordBridgeResult(credentials.Source, false, resp.StatusCode, errorTextFromBody(resp.Body))
 		return nil, upstreamStatusError(resp.StatusCode, resp.Body)
 	}
+	recordBridgeResult(credentials.Source, true, resp.StatusCode, "")
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 }
 
@@ -485,13 +581,15 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 	resp, errHTTP := doHTTPStream(req.HostCallbackID, cfg, credentials, req.ExecutorRequest, body)
 	if errHTTP != nil {
+		recordBridgeResult(credentials.Source, false, statusCodeFromError(errHTTP), errHTTP.Error())
 		return nil, errHTTP
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = callHost(pluginabi.MethodHostHTTPStreamClose, hostHTTPStreamCloseRequest{StreamID: resp.StreamID})
+		recordBridgeResult(credentials.Source, false, resp.StatusCode, fmt.Sprintf("upstream stream returned HTTP %d", resp.StatusCode))
 		return nil, upstreamStatusError(resp.StatusCode, nil)
 	}
-	go pumpStream(req.StreamID, resp.StreamID)
+	go pumpStream(req.StreamID, resp.StreamID, credentials.Source, resp.StatusCode)
 	return okEnvelope(rpcExecutorStreamResponse{Headers: resp.Headers})
 }
 
@@ -553,7 +651,7 @@ func doHTTPStream(callbackID string, cfg pluginConfig, credentials upstreamCrede
 	return resp, nil
 }
 
-func pumpStream(outputID, upstreamID string) {
+func pumpStream(outputID, upstreamID, source string, status int) {
 	defer func() {
 		_, _ = callHost(pluginabi.MethodHostHTTPStreamClose, hostHTTPStreamCloseRequest{StreamID: upstreamID})
 		_, _ = callHost(pluginabi.MethodHostStreamClose, hostStreamCloseRequest{StreamID: outputID})
@@ -561,24 +659,29 @@ func pumpStream(outputID, upstreamID string) {
 	for {
 		raw, errCall := callHost(pluginabi.MethodHostHTTPStreamRead, hostHTTPStreamReadRequest{StreamID: upstreamID})
 		if errCall != nil {
+			recordBridgeResult(source, false, statusCodeFromError(errCall), errCall.Error())
 			_, _ = callHost(pluginabi.MethodHostStreamClose, hostStreamCloseRequest{StreamID: outputID, Error: errCall.Error()})
 			return
 		}
 		var chunk hostHTTPStreamReadResponse
 		if errDecode := json.Unmarshal(raw, &chunk); errDecode != nil {
+			recordBridgeResult(source, false, status, errDecode.Error())
 			_, _ = callHost(pluginabi.MethodHostStreamClose, hostStreamCloseRequest{StreamID: outputID, Error: errDecode.Error()})
 			return
 		}
 		if len(chunk.Payload) > 0 {
 			if _, errEmit := callHost(pluginabi.MethodHostStreamEmit, hostStreamEmitRequest{StreamID: outputID, Payload: chunk.Payload}); errEmit != nil {
+				recordBridgeResult(source, false, statusCodeFromError(errEmit), errEmit.Error())
 				return
 			}
 		}
 		if chunk.Error != "" {
+			recordBridgeResult(source, false, status, chunk.Error)
 			_, _ = callHost(pluginabi.MethodHostStreamClose, hostStreamCloseRequest{StreamID: outputID, Error: chunk.Error})
 			return
 		}
 		if chunk.Done {
+			recordBridgeResult(source, true, status, "")
 			return
 		}
 	}
@@ -960,6 +1063,354 @@ func upstreamStatusError(status int, body []byte) error {
 		}
 	}
 	return &statusError{code: code, message: message, statusCode: status, retryable: status == 429 || status >= 500}
+}
+
+func statusCodeFromError(err error) int {
+	var sc interface{ StatusCode() int }
+	if errors.As(err, &sc) && sc != nil {
+		return sc.StatusCode()
+	}
+	return 0
+}
+
+func errorTextFromBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &payload) == nil {
+		if strings.TrimSpace(payload.Error.Message) != "" {
+			return strings.TrimSpace(payload.Error.Message)
+		}
+		if strings.TrimSpace(payload.Message) != "" {
+			return strings.TrimSpace(payload.Message)
+		}
+	}
+	text := strings.TrimSpace(string(body))
+	if len(text) > 240 {
+		text = text[:240] + "…"
+	}
+	return text
+}
+
+func recordBridgeResult(source string, success bool, status int, errText string) {
+	source = normalizeBridgeSource(source)
+	now := time.Now().UTC()
+
+	bridgeRuntime.Lock()
+	defer bridgeRuntime.Unlock()
+	entry := bridgeRuntime.bySource[source]
+	if entry == nil {
+		entry = &bridgeRuntimeEntry{}
+		bridgeRuntime.bySource[source] = entry
+	}
+	entry.Requests++
+	entry.LastStatus = status
+	entry.LastRequestAt = now
+	if success {
+		entry.Successes++
+		entry.LastError = ""
+		entry.LastSuccessAt = now
+		return
+	}
+	entry.Failures++
+	entry.LastError = strings.TrimSpace(errText)
+	entry.LastFailureAt = now
+}
+
+func normalizeBridgeSource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "unknown"
+	}
+	return source
+}
+
+func bridgeRuntimeSnapshot() map[string]bridgeRuntimeEntry {
+	bridgeRuntime.Lock()
+	defer bridgeRuntime.Unlock()
+	out := make(map[string]bridgeRuntimeEntry, len(bridgeRuntime.bySource))
+	for source, entry := range bridgeRuntime.bySource {
+		if entry == nil {
+			continue
+		}
+		out[source] = *entry
+	}
+	return out
+}
+
+func handleManagement(raw []byte) ([]byte, error) {
+	var req rpcManagementRequest
+	if len(raw) > 0 {
+		if errDecode := json.Unmarshal(raw, &req); errDecode != nil {
+			return nil, fmt.Errorf("decode management request: %w", errDecode)
+		}
+	}
+	cfg := loadedConfig()
+	data := collectManagementStatus(cfg)
+	page := renderManagementStatusPage(data)
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+		Body:       page,
+	})
+}
+
+func collectManagementStatus(cfg pluginConfig) managementStatusPageData {
+	data := managementStatusPageData{
+		GeneratedAt:   time.Now().UTC(),
+		Config:        cfg,
+		SidecarSource: authModeSidecar,
+	}
+	stats := bridgeRuntimeSnapshot()
+	for source, item := range stats {
+		data.TotalRequests += item.Requests
+		data.TotalSuccesses += item.Successes
+		data.TotalFailures += item.Failures
+		data.Bridges = append(data.Bridges, managementBridgeRow{
+			Source:        source,
+			Requests:      item.Requests,
+			Successes:     item.Successes,
+			Failures:      item.Failures,
+			LastStatus:    item.LastStatus,
+			LastError:     item.LastError,
+			LastRequestAt: item.LastRequestAt,
+		})
+		if data.LastBridge == "" || item.LastRequestAt.After(stats[data.LastBridge].LastRequestAt) {
+			data.LastBridge = source
+		}
+	}
+	sort.SliceStable(data.Bridges, func(i, j int) bool {
+		return data.Bridges[i].Source < data.Bridges[j].Source
+	})
+
+	rawList, errList := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	if errList != nil {
+		data.HomeError = errList.Error()
+		return data
+	}
+	data.HomeAvailable = true
+	var list hostAuthListResponse
+	if errDecode := json.Unmarshal(rawList, &list); errDecode != nil {
+		data.HomeError = fmt.Sprintf("decode Home auth list: %v", errDecode)
+		return data
+	}
+	for _, entry := range availableHomeEntries(cfg, list.Files) {
+		row := managementAccountRow{
+			AuthIndex:   entry.AuthIndex,
+			Name:        entry.Name,
+			Label:       entry.Label,
+			Email:       entry.Email,
+			Status:      entry.Status,
+			Disabled:    entry.Disabled,
+			Unavailable: entry.Unavailable,
+			RuntimeOnly: entry.RuntimeOnly,
+			Selected:    cfg.AuthIndex != "" && entry.AuthIndex == cfg.AuthIndex,
+		}
+		if row.Status == "" {
+			row.Status = "available"
+		}
+		if stat, ok := stats[authModeHome+":"+entry.AuthIndex]; ok {
+			row.Requests = stat.Requests
+			row.Successes = stat.Successes
+			row.Failures = stat.Failures
+			row.LastStatus = stat.LastStatus
+			row.LastError = stat.LastError
+			row.LastRequestAt = stat.LastRequestAt
+			row.LastSuccessAt = stat.LastSuccessAt
+			row.LastFailureAt = stat.LastFailureAt
+		}
+		data.Accounts = append(data.Accounts, row)
+	}
+	sort.SliceStable(data.Accounts, func(i, j int) bool {
+		return data.Accounts[i].AuthIndex < data.Accounts[j].AuthIndex
+	})
+	return data
+}
+
+func availableHomeEntries(cfg pluginConfig, entries []pluginapi.HostAuthFileEntry) []pluginapi.HostAuthFileEntry {
+	out := make([]pluginapi.HostAuthFileEntry, 0, len(entries))
+	for _, entry := range entries {
+		provider := strings.TrimSpace(entry.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(entry.Type)
+		}
+		if cfg.AuthProvider != "" && !strings.EqualFold(provider, cfg.AuthProvider) {
+			continue
+		}
+		if cfg.AuthIndex != "" && entry.AuthIndex != cfg.AuthIndex {
+			continue
+		}
+		if entry.AuthIndex == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func renderManagementStatusPage(data managementStatusPageData) []byte {
+	var builder strings.Builder
+	builder.WriteString(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`)
+	builder.WriteString(`<title>Excel Codex Bridge</title>`)
+	builder.WriteString(`<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:24px;color:#dce6f0;background:#0d1824;line-height:1.45}a{color:#8ec5ff}.card{background:#132334;border:1px solid #294057;border-radius:14px;padding:18px;margin:0 0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.metric{background:#0f1c2a;border:1px solid #24384d;border-radius:12px;padding:14px}.metric b{display:block;font-size:24px;color:#fff}.muted{color:#9db0c4}.ok{color:#73e2a7}.warn{color:#ffd166}.bad{color:#ff8b8b}table{width:100%;border-collapse:collapse;background:#0f1c2a;border-radius:12px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid #24384d;padding:10px 12px;vertical-align:top}th{color:#b9c8d8;background:#16293c}code{background:#0b1420;border:1px solid #24384d;border-radius:6px;padding:1px 5px}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#21374e;color:#dce6f0;font-size:12px}.error{white-space:pre-wrap;color:#ffb4b4}</style>`)
+	builder.WriteString(`</head><body><main>`)
+	builder.WriteString(`<h1>Excel Codex Bridge</h1>`)
+	builder.WriteString(`<p class="muted">Generated at ` + escape(data.GeneratedAt.Format(time.RFC3339)) + ` · <a href="?">Refresh</a></p>`)
+
+	builder.WriteString(`<section class="card"><h2>Runtime</h2><div class="grid">`)
+	writeMetric(&builder, "Requests", data.TotalRequests)
+	writeMetric(&builder, "Successes", data.TotalSuccesses)
+	writeMetric(&builder, "Failures", data.TotalFailures)
+	builder.WriteString(`<div class="metric"><span class="muted">Recently used</span><b>`)
+	builder.WriteString(escape(displayBridgeSource(data.LastBridge)))
+	builder.WriteString(`</b></div>`)
+	builder.WriteString(`</div></section>`)
+
+	if len(data.Bridges) > 0 {
+		builder.WriteString(`<section class="card"><h2>Bridge sources</h2><table><thead><tr><th>Source</th><th>Requests</th><th>Last result</th><th>Last error</th></tr></thead><tbody>`)
+		for _, row := range data.Bridges {
+			builder.WriteString(`<tr><td><code>`)
+			builder.WriteString(escape(displayBridgeSource(row.Source)))
+			builder.WriteString(`</code></td><td>`)
+			builder.WriteString(fmt.Sprintf(`%d total<br><span class="ok">%d ok</span> · <span class="bad">%d fail</span>`, row.Requests, row.Successes, row.Failures))
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(escape(lastBridgeResultText(row)))
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(escape(row.LastError))
+			builder.WriteString(`</td></tr>`)
+		}
+		builder.WriteString(`</tbody></table></section>`)
+	}
+
+	builder.WriteString(`<section class="card"><h2>Config</h2><table><tbody>`)
+	writeKV(&builder, "enabled", fmt.Sprint(data.Config.Enabled))
+	writeKV(&builder, "auth_mode", data.Config.AuthMode)
+	writeKV(&builder, "base_url", data.Config.BaseURL)
+	writeKV(&builder, "auth_provider", data.Config.AuthProvider)
+	writeKV(&builder, "auth_strategy", data.Config.AuthStrategy)
+	writeKV(&builder, "auth_index", data.Config.AuthIndex)
+	builder.WriteString(`</tbody></table></section>`)
+
+	builder.WriteString(`<section class="card"><h2>Home bridge accounts</h2>`)
+	if data.HomeError != "" {
+		builder.WriteString(`<p class="error">Home auth list unavailable: ` + escape(data.HomeError) + `</p>`)
+	} else if len(data.Accounts) == 0 {
+		builder.WriteString(`<p class="muted">No matching Home Codex account is currently available for this plugin config.</p>`)
+	} else {
+		builder.WriteString(`<table><thead><tr><th>Account</th><th>Status</th><th>Requests</th><th>Last result</th><th>Last error</th></tr></thead><tbody>`)
+		for _, row := range data.Accounts {
+			builder.WriteString(`<tr><td>`)
+			builder.WriteString(escape(accountLabel(row)))
+			builder.WriteString(`<br><code>`)
+			builder.WriteString(escape(row.AuthIndex))
+			builder.WriteString(`</code>`)
+			if row.Selected {
+				builder.WriteString(` <span class="pill">pinned</span>`)
+			}
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(statusHTML(row))
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(fmt.Sprintf("%d total<br><span class=\"ok\">%d ok</span> · <span class=\"bad\">%d fail</span>", row.Requests, row.Successes, row.Failures))
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(escape(lastResultText(row)))
+			builder.WriteString(`</td><td>`)
+			builder.WriteString(escape(row.LastError))
+			builder.WriteString(`</td></tr>`)
+		}
+		builder.WriteString(`</tbody></table>`)
+	}
+	builder.WriteString(`</section>`)
+
+	builder.WriteString(`<section class="card"><h2>What this page means</h2><p class="muted">Home mode treats each available Codex credential as one internal Excel bridge. <code>sticky</code> keeps the same session on the same account; requests without session metadata fall back to round-robin. This page never reads or displays tokens.</p></section>`)
+	builder.WriteString(`</main></body></html>`)
+	return []byte(builder.String())
+}
+
+func writeMetric(builder *strings.Builder, label string, value uint64) {
+	builder.WriteString(`<div class="metric"><span class="muted">`)
+	builder.WriteString(escape(label))
+	builder.WriteString(`</span><b>`)
+	builder.WriteString(fmt.Sprint(value))
+	builder.WriteString(`</b></div>`)
+}
+
+func writeKV(builder *strings.Builder, key, value string) {
+	if strings.TrimSpace(value) == "" {
+		value = "—"
+	}
+	builder.WriteString(`<tr><th>`)
+	builder.WriteString(escape(key))
+	builder.WriteString(`</th><td><code>`)
+	builder.WriteString(escape(value))
+	builder.WriteString(`</code></td></tr>`)
+}
+
+func accountLabel(row managementAccountRow) string {
+	for _, value := range []string{row.Label, row.Email, row.Name} {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return row.AuthIndex
+}
+
+func statusHTML(row managementAccountRow) string {
+	className := "ok"
+	text := row.Status
+	if row.Disabled {
+		className = "bad"
+		text = "disabled"
+	} else if row.Unavailable {
+		className = "bad"
+		text = "unavailable"
+	} else if row.RuntimeOnly {
+		className = "warn"
+		text = "runtime-only"
+	}
+	return `<span class="` + className + `">` + escape(text) + `</span>`
+}
+
+func lastResultText(row managementAccountRow) string {
+	if row.LastRequestAt.IsZero() {
+		return "No requests yet"
+	}
+	parts := []string{row.LastRequestAt.Format(time.RFC3339)}
+	if row.LastStatus > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", row.LastStatus))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func lastBridgeResultText(row managementBridgeRow) string {
+	if row.LastRequestAt.IsZero() {
+		return "No requests yet"
+	}
+	parts := []string{row.LastRequestAt.Format(time.RFC3339)}
+	if row.LastStatus > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", row.LastStatus))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func displayBridgeSource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "—"
+	}
+	if strings.HasPrefix(source, authModeHome+":") {
+		return "home " + strings.TrimPrefix(source, authModeHome+":")
+	}
+	return source
+}
+
+func escape(value string) string {
+	return html.EscapeString(value)
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {

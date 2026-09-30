@@ -1,12 +1,12 @@
 schema_version: 1
 id: excel-codex
 name: Excel Codex
-version: 0.3.0
+version: 0.4.0
 author: kccolhub
 description: >-
   CPA native executor for the Excel Codex bridge. It exposes Excel model
   aliases, turns every available CPA Home Codex credential into an internal
-  bridge candidate for the official BPS endpoint, and can also forward through
-  an excel-sub2api sidecar.
+  bridge candidate for the official BPS endpoint, exposes a bridge runtime
+  status page, and can also forward through an excel-sub2api sidecar.
 repository: https://github.com/kccolhub/cpa-plugin-excel-codex
 license: MIT

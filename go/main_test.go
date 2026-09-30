@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -123,5 +124,88 @@ func TestExcelModelsAdvertiseBothContextWindows(t *testing.T) {
 	}
 	if !seenLong {
 		t.Fatal("no long-context Excel model advertised")
+	}
+}
+
+func TestSelectHomeBridgeStickyUsesSessionAffinity(t *testing.T) {
+	candidates := []pluginapi.HostAuthFileEntry{
+		{AuthIndex: "account-a"},
+		{AuthIndex: "account-b"},
+		{AuthIndex: "account-c"},
+	}
+	cfg := pluginConfig{AuthStrategy: authStrategySticky, AuthProvider: "codex"}
+	req := pluginapi.ExecutorRequest{
+		Headers: http.Header{"X-Codex-Session-ID": []string{"session-123"}},
+	}
+	first, err := selectHomeBridge(cfg, candidates, req)
+	if err != nil {
+		t.Fatalf("selectHomeBridge() error = %v", err)
+	}
+	second, err := selectHomeBridge(cfg, candidates, req)
+	if err != nil {
+		t.Fatalf("selectHomeBridge() second error = %v", err)
+	}
+	if first.AuthIndex == "" || first.AuthIndex != second.AuthIndex {
+		t.Fatalf("sticky bridge indexes = %q and %q, want the same account", first.AuthIndex, second.AuthIndex)
+	}
+}
+
+func TestSelectHomeBridgeRoundRobinCyclesAccounts(t *testing.T) {
+	candidates := []pluginapi.HostAuthFileEntry{
+		{AuthIndex: "account-a"},
+		{AuthIndex: "account-b"},
+	}
+	cfg := pluginConfig{AuthStrategy: authStrategyRoundRobin, AuthProvider: "codex"}
+	homeBridgeCounter.Store(0)
+	first, err := selectHomeBridge(cfg, candidates, pluginapi.ExecutorRequest{})
+	if err != nil {
+		t.Fatalf("selectHomeBridge() first error = %v", err)
+	}
+	second, err := selectHomeBridge(cfg, candidates, pluginapi.ExecutorRequest{})
+	if err != nil {
+		t.Fatalf("selectHomeBridge() second error = %v", err)
+	}
+	third, err := selectHomeBridge(cfg, candidates, pluginapi.ExecutorRequest{})
+	if err != nil {
+		t.Fatalf("selectHomeBridge() third error = %v", err)
+	}
+	if first.AuthIndex != "account-a" || second.AuthIndex != "account-b" || third.AuthIndex != "account-a" {
+		t.Fatalf("round robin indexes = %q, %q, %q", first.AuthIndex, second.AuthIndex, third.AuthIndex)
+	}
+}
+
+func TestSelectHomeBridgeHonorsExplicitAuthIndex(t *testing.T) {
+	candidates := []pluginapi.HostAuthFileEntry{
+		{AuthIndex: "account-a"},
+		{AuthIndex: "account-b"},
+	}
+	cfg := pluginConfig{AuthIndex: "account-b", AuthStrategy: authStrategyFirst, AuthProvider: "codex"}
+	selected, err := selectHomeBridge(cfg, candidates, pluginapi.ExecutorRequest{})
+	if err != nil {
+		t.Fatalf("selectHomeBridge() error = %v", err)
+	}
+	if selected.AuthIndex != "account-b" {
+		t.Fatalf("selected auth index = %q, want account-b", selected.AuthIndex)
+	}
+}
+
+func TestRequestAffinityKeyPrefersSessionHeadersThenMetadataThenQuery(t *testing.T) {
+	req := pluginapi.ExecutorRequest{
+		Headers: http.Header{"X-Codex-Session-ID": []string{"header-session"}},
+		Query:   url.Values{"session_id": []string{"query-session"}},
+		Metadata: map[string]any{
+			"session_id": "metadata-session",
+		},
+	}
+	if got := requestAffinityKey(req); got != "header-session" {
+		t.Fatalf("requestAffinityKey() = %q, want header-session", got)
+	}
+	req.Headers = nil
+	if got := requestAffinityKey(req); got != "metadata-session" {
+		t.Fatalf("requestAffinityKey() = %q, want metadata-session", got)
+	}
+	req.Metadata = nil
+	if got := requestAffinityKey(req); got != "query-session" {
+		t.Fatalf("requestAffinityKey() = %q, want query-session", got)
 	}
 }

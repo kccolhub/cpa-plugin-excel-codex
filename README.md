@@ -15,6 +15,10 @@ Responses API 接入 CPA：CPA 收到 `gpt-*-excel` 请求后，插件将请求�
 
 `auth_mode: auto` 会在官方 BPS 地址优先复用 Home 凭证，在其他地址使用 sidecar API key。
 Home 保存的凭证由 CPA 自己负责刷新，插件每次请求读取最新文件，不会写回或复制一份登录态。
+在 Home 模式下，每个可用的 Codex 凭证都作为一个内部 Excel bridge 候选账号参与调度：
+默认 `auth_strategy: sticky` 会让带有相同会话标识的请求固定到同一账号，没有会话标识时按轮询
+分配；也可以使用 `auth_strategy: round_robin` 强制轮询，或使用 `auth_strategy: first`
+保持只使用排序后的第一个账号。填写 `auth_index` 会固定到指定账号。
 
 ## CPA 配置
 
@@ -47,7 +51,8 @@ plugins:
       auth_mode: home
       base_url: https://bps.openai.com/basispoints/api
       auth_provider: codex
-      # Home 有多个 Codex 账号时，可填 host.auth.list 返回的 auth_index
+      auth_strategy: sticky
+      # Home 有多个 Codex 账号时，可改成 round_robin，或填 auth_index 固定一个账号
       # auth_index: codex-xxx.json
 ```
 

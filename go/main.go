@@ -60,9 +60,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -76,9 +78,10 @@ const pluginID = "excel-codex"
 
 // pluginVersion is overridden by the release workflow so the binary metadata
 // and the CPA release asset always use the same version.
-var pluginVersion = "0.2.0"
+var pluginVersion = "0.3.0"
 
 var currentConfig atomic.Value
+var homeBridgeCounter atomic.Uint64
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -109,6 +112,7 @@ type pluginConfig struct {
 	AuthMode     string `yaml:"auth_mode"`
 	AuthProvider string `yaml:"auth_provider"`
 	AuthIndex    string `yaml:"auth_index"`
+	AuthStrategy string `yaml:"auth_strategy"`
 	APIKey       string `yaml:"api_key"`
 	APIKeyEnv    string `yaml:"api_key_env"`
 	AccountID    string `yaml:"account_id"`
@@ -118,6 +122,10 @@ const (
 	authModeAuto    = "auto"
 	authModeHome    = "home"
 	authModeSidecar = "sidecar"
+
+	authStrategySticky     = "sticky"
+	authStrategyRoundRobin = "round_robin"
+	authStrategyFirst      = "first"
 )
 
 type upstreamCredentials struct {
@@ -294,6 +302,7 @@ func defaultPluginConfig() pluginConfig {
 		BaseURL:      "http://127.0.0.1:8000",
 		AuthMode:     authModeAuto,
 		AuthProvider: "codex",
+		AuthStrategy: authStrategySticky,
 		APIKeyEnv:    "EXCEL_CODEX_API_KEY",
 	}
 }
@@ -315,6 +324,8 @@ func configure(raw []byte) error {
 	cfg.AuthMode = strings.ToLower(strings.TrimSpace(cfg.AuthMode))
 	cfg.AuthProvider = strings.ToLower(strings.TrimSpace(cfg.AuthProvider))
 	cfg.AuthIndex = strings.TrimSpace(cfg.AuthIndex)
+	cfg.AuthStrategy = strings.ToLower(strings.TrimSpace(cfg.AuthStrategy))
+	cfg.AuthStrategy = strings.ReplaceAll(cfg.AuthStrategy, "-", "_")
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	cfg.APIKeyEnv = strings.TrimSpace(cfg.APIKeyEnv)
 	cfg.AccountID = strings.TrimSpace(cfg.AccountID)
@@ -331,6 +342,14 @@ func configure(raw []byte) error {
 	case authModeAuto, authModeHome, authModeSidecar:
 	default:
 		return fmt.Errorf("auth_mode must be one of %q, %q, or %q", authModeAuto, authModeHome, authModeSidecar)
+	}
+	if cfg.AuthStrategy == "" {
+		cfg.AuthStrategy = defaultPluginConfig().AuthStrategy
+	}
+	switch cfg.AuthStrategy {
+	case authStrategySticky, authStrategyRoundRobin, authStrategyFirst:
+	default:
+		return fmt.Errorf("auth_strategy must be one of %q, %q, or %q", authStrategySticky, authStrategyRoundRobin, authStrategyFirst)
 	}
 	if cfg.APIKeyEnv == "" {
 		cfg.APIKeyEnv = defaultPluginConfig().APIKeyEnv
@@ -362,6 +381,7 @@ func pluginRegistration() registration {
 				{Name: "auth_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{authModeAuto, authModeHome, authModeSidecar}, Description: "Credential source: home reuses a CPA Home Codex credential, sidecar uses the bridge API key, and auto selects based on the endpoint."},
 				{Name: "auth_provider", Type: pluginapi.ConfigFieldTypeString, Description: "Home credential provider to read when auth_mode is home or auto, normally codex."},
 				{Name: "auth_index", Type: pluginapi.ConfigFieldTypeString, Description: "Optional exact Home auth_index. Set this when Home stores more than one Codex credential."},
+				{Name: "auth_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{authStrategySticky, authStrategyRoundRobin, authStrategyFirst}, Description: "Home multi-account bridge selection: sticky keeps a session on one account, round_robin distributes requests, and first keeps legacy single-account behavior."},
 				{Name: "api_key", Type: pluginapi.ConfigFieldTypeString, Description: "Bearer key for the configured Excel bridge endpoint. Leave empty to read api_key_env."},
 				{Name: "api_key_env", Type: pluginapi.ConfigFieldTypeString, Description: "Environment variable containing the bridge API key."},
 				{Name: "account_id", Type: pluginapi.ConfigFieldTypeString, Description: "Optional account ID override forwarded as chatgpt-account-id."},
@@ -425,7 +445,7 @@ func execute(raw []byte) ([]byte, error) {
 	if !cfg.Enabled {
 		return nil, &statusError{code: "plugin_disabled", message: "Excel Codex plugin is disabled", statusCode: 503, retryable: false}
 	}
-	credentials, errCredentials := credentialsForRequest(cfg)
+	credentials, errCredentials := credentialsForRequest(cfg, req.ExecutorRequest)
 	if errCredentials != nil {
 		return nil, &statusError{code: "credentials_unavailable", message: errCredentials.Error(), statusCode: 503, retryable: true}
 	}
@@ -452,7 +472,7 @@ func executeStream(raw []byte) ([]byte, error) {
 	if !cfg.Enabled {
 		return nil, &statusError{code: "plugin_disabled", message: "Excel Codex plugin is disabled", statusCode: 503, retryable: false}
 	}
-	credentials, errCredentials := credentialsForRequest(cfg)
+	credentials, errCredentials := credentialsForRequest(cfg, req.ExecutorRequest)
 	if errCredentials != nil {
 		return nil, &statusError{code: "credentials_unavailable", message: errCredentials.Error(), statusCode: 503, retryable: true}
 	}
@@ -601,15 +621,15 @@ func requestHeaders(credentials upstreamCredentials, inbound http.Header, stream
 	return headers
 }
 
-func credentialsForRequest(cfg pluginConfig) (upstreamCredentials, error) {
+func credentialsForRequest(cfg pluginConfig, req pluginapi.ExecutorRequest) (upstreamCredentials, error) {
 	switch cfg.AuthMode {
 	case authModeHome:
-		return loadHomeCredentials(cfg)
+		return loadHomeCredentials(cfg, req)
 	case authModeSidecar:
 		return sidecarCredentials(cfg)
 	case authModeAuto:
 		if isTrustedBPSBaseURL(cfg.BaseURL) {
-			if credentials, errHome := loadHomeCredentials(cfg); errHome == nil {
+			if credentials, errHome := loadHomeCredentials(cfg, req); errHome == nil {
 				return credentials, nil
 			}
 		}
@@ -617,7 +637,7 @@ func credentialsForRequest(cfg pluginConfig) (upstreamCredentials, error) {
 			return upstreamCredentials{Token: key, AccountID: cfg.AccountID, Source: authModeSidecar}, nil
 		}
 		if isTrustedBPSBaseURL(cfg.BaseURL) {
-			return loadHomeCredentials(cfg)
+			return loadHomeCredentials(cfg, req)
 		}
 		return upstreamCredentials{}, fmt.Errorf("auth_mode=auto needs a sidecar API key for %s, or set auth_mode=home with https://bps.openai.com/basispoints/api", cfg.BaseURL)
 	default:
@@ -633,7 +653,7 @@ func sidecarCredentials(cfg pluginConfig) (upstreamCredentials, error) {
 	return upstreamCredentials{Token: key, AccountID: cfg.AccountID, Source: authModeSidecar}, nil
 }
 
-func loadHomeCredentials(cfg pluginConfig) (upstreamCredentials, error) {
+func loadHomeCredentials(cfg pluginConfig, req pluginapi.ExecutorRequest) (upstreamCredentials, error) {
 	if !isTrustedBPSBaseURL(cfg.BaseURL) {
 		return upstreamCredentials{}, fmt.Errorf("auth_mode=home only permits https://bps.openai.com/basispoints/api; use auth_mode=sidecar for excel-sub2api")
 	}
@@ -646,9 +666,9 @@ func loadHomeCredentials(cfg pluginConfig) (upstreamCredentials, error) {
 		return upstreamCredentials{}, fmt.Errorf("decode Home auth list: %w", errDecode)
 	}
 
-	var selected *pluginapi.HostAuthFileEntry
+	candidates := make([]pluginapi.HostAuthFileEntry, 0, len(list.Files))
 	for index := range list.Files {
-		entry := &list.Files[index]
+		entry := list.Files[index]
 		provider := strings.TrimSpace(entry.Provider)
 		if provider == "" {
 			provider = strings.TrimSpace(entry.Type)
@@ -662,14 +682,14 @@ func loadHomeCredentials(cfg pluginConfig) (upstreamCredentials, error) {
 		if entry.Disabled || entry.Unavailable || entry.RuntimeOnly || entry.AuthIndex == "" {
 			continue
 		}
-		selected = entry
-		break
+		candidates = append(candidates, entry)
 	}
-	if selected == nil {
-		if cfg.AuthIndex != "" {
-			return upstreamCredentials{}, fmt.Errorf("Home auth_index %q was not found or is unavailable", cfg.AuthIndex)
-		}
-		return upstreamCredentials{}, fmt.Errorf("Home has no available %s credential", cfg.AuthProvider)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].AuthIndex < candidates[j].AuthIndex
+	})
+	selected, errSelect := selectHomeBridge(cfg, candidates, req)
+	if errSelect != nil {
+		return upstreamCredentials{}, errSelect
 	}
 
 	rawAuth, errGet := callHost(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: selected.AuthIndex})
@@ -687,8 +707,120 @@ func loadHomeCredentials(cfg pluginConfig) (upstreamCredentials, error) {
 	if cfg.AccountID != "" {
 		credentials.AccountID = cfg.AccountID
 	}
-	credentials.Source = authModeHome
+	credentials.Source = authModeHome + ":" + selected.AuthIndex
 	return credentials, nil
+}
+
+func selectHomeBridge(cfg pluginConfig, candidates []pluginapi.HostAuthFileEntry, req pluginapi.ExecutorRequest) (*pluginapi.HostAuthFileEntry, error) {
+	if len(candidates) == 0 {
+		if cfg.AuthIndex != "" {
+			return nil, fmt.Errorf("Home auth_index %q was not found or is unavailable", cfg.AuthIndex)
+		}
+		return nil, fmt.Errorf("Home has no available %s credential", cfg.AuthProvider)
+	}
+	if cfg.AuthIndex != "" {
+		for index := range candidates {
+			if candidates[index].AuthIndex == cfg.AuthIndex {
+				return &candidates[index], nil
+			}
+		}
+		return nil, fmt.Errorf("Home auth_index %q was not found or is unavailable", cfg.AuthIndex)
+	}
+	if len(candidates) == 1 {
+		return &candidates[0], nil
+	}
+
+	switch cfg.AuthStrategy {
+	case authStrategyFirst:
+		return &candidates[0], nil
+	case authStrategyRoundRobin:
+		return &candidates[nextHomeBridgeIndex(len(candidates))], nil
+	case authStrategySticky:
+		if key := requestAffinityKey(req); key != "" {
+			return &candidates[bridgeIndexFromKey(key, len(candidates))], nil
+		}
+		return &candidates[nextHomeBridgeIndex(len(candidates))], nil
+	default:
+		return nil, fmt.Errorf("unsupported auth_strategy %q", cfg.AuthStrategy)
+	}
+}
+
+func nextHomeBridgeIndex(count int) int {
+	if count <= 1 {
+		return 0
+	}
+	return int(homeBridgeCounter.Add(1)-1) % count
+}
+
+func bridgeIndexFromKey(key string, count int) int {
+	if count <= 1 {
+		return 0
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	return int(hash.Sum64() % uint64(count))
+}
+
+func requestAffinityKey(req pluginapi.ExecutorRequest) string {
+	for _, name := range []string{
+		"x-codex-session-id",
+		"x-codex-thread-id",
+		"x-codex-parent-thread-id",
+		"x-cliproxy-session-id",
+		"x-session-id",
+	} {
+		if value := headerString(req.Headers, name); value != "" {
+			return value
+		}
+	}
+	for _, name := range []string{
+		"session_id",
+		"thread_id",
+		"parent_thread_id",
+		"canonical_session_id",
+		"codex_session_id",
+		"codex_thread_id",
+		"lcp_session_id",
+	} {
+		if value := metadataString(req.Metadata, name); value != "" {
+			return value
+		}
+	}
+	for _, name := range []string{"session_id", "thread_id"} {
+		if value := strings.TrimSpace(req.Query.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func headerString(headers http.Header, key string) string {
+	for name, values := range headers {
+		if !strings.EqualFold(name, key) {
+			continue
+		}
+		for _, value := range values {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func metadataString(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, ok := values[key]
+	if !ok {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 func extractHomeCredentials(raw []byte) (upstreamCredentials, error) {
